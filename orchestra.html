@@ -1,0 +1,1170 @@
+<!DOCTYPE html>
+<title>Reaction Orchestra</title>
+<meta charset="utf-8">
+<meta name="author" content="Alexander Mordvintsev">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>body {
+    box-sizing: border-box;
+    background:black; margin: 0px;
+    color: white;
+    overflow: hidden;
+    font-family: 'Roboto Mono', monospace;
+    user-select: none;
+}
+
+#panel {
+    width: 200px;
+    position: fixed;
+    background: rgba(0, 0, 0, 0.5);
+}
+
+#panel summary {
+    padding: 8px;
+}
+
+#cards {
+    overflow: auto;
+    height: 95vh;
+}
+
+.card {
+    padding: 4px;
+    margin: 8px;
+    border: 1px solid grey;
+    border-radius: 5px;
+    font-size: 14px;
+}
+
+#panel img {
+    max-width: 100%;
+}
+
+#demo {
+  width: 100%; height:100vh    
+}
+
+#c {
+    width: 100%; height:100%;
+    background:black;
+    touch-action: none;
+}
+
+#gui { 
+    position: fixed; bottom:0px; right:50px
+}
+#buttons {
+    position:fixed; bottom:10px; right:10px;
+}
+button{
+    appearance: none;
+    width:48px; height: 40px;
+    margin: 8px;
+    font-size: 24px;
+    background-color: rgba(0, 0, 0, .5);
+    color: white;
+    border: none;
+    text-align: center;
+    text-decoration: none;
+    display: block;
+}
+button:hover {
+    background-color: rgba(80, 80, 80, 0.8);
+}
+#buttons a {
+    text-decoration: none;
+}
+a {
+    color: aquamarine;
+}</style>
+
+<script>// Copyright 2023 Google LLC
+
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+
+//     https://www.apache.org/licenses/LICENSE-2.0
+
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+
+// Repeat/Loop?
+// fbo:
+// - multiple named render targets (Out...?)
+// - stencil?
+// - mipmaps?
+// samplers/filter?
+// data texture subimage?
+// glsl lib
+// - hash (overloads)
+// - 3d prim/helpers
+// - universal geom (mesh)
+// devicePixelRatio
+// depth test modes
+
+// pain points:
+// - view transform params
+// - fragment only aspect
+// - tag already exists
+
+const Type2Setter = {};
+for (const t of ['FLOAT', 'INT', 'BOOL']) {
+    const suf = t=='FLOAT' ? 'f':'i';
+    const GL = WebGL2RenderingContext;
+    Type2Setter[GL[t]] = 'uniform1'+suf;
+    for (const i of [2, 3, 4]) {
+        Type2Setter[GL[`${t}_VEC${i}`]] = `uniform${i}${suf}v`;
+        if (suf=='f') {
+            Type2Setter[GL[`${t}_MAT${i}`]] = `uniformMatrix${i}fv`;
+        }
+    }
+}
+
+function memoize(f) {
+    const cache = {};
+    const wrap = k => k in cache ? cache[k] : cache[k]=f(k);
+    wrap.cache = cache;
+    return wrap;
+}
+
+// Parse strings like 'min(s,d)', 'max(s,d)', 's*d', 's+d*(1-sa)',
+// 's*d', 'd*(1-sa) + s*sa', s-d', 'd-s' and so on into
+// gl.blendFunc/gl.blendEquation arguments.
+function parseBlend(s0) {
+    if (!s0) return;
+    let s = s0.replace(/\s+/g, '');
+    if (!s) return null;
+    const GL = WebGL2RenderingContext;
+    const func2gl = {
+        'min': GL.MIN, 'max': GL.MAX, '+':GL.FUNC_ADD,
+        's-d': GL.FUNC_SUBTRACT, 'd-s': GL.FUNC_REVERSE_SUBTRACT
+    };
+    const factor2gl = {
+        '0': GL.ZERO, '1': GL.ONE,
+        's': GL.SRC_COLOR, '(1-s)': GL.ONE_MINUS_SRC_COLOR,
+        'd': GL.DST_COLOR, '(1-d)': GL.ONE_MINUS_DST_COLOR,
+        'sa': GL.SRC_ALPHA, '(1-sa)': GL.ONE_MINUS_SRC_ALPHA,
+        'da': GL.DST_ALPHA, '(1-da)': GL.ONE_MINUS_DST_ALPHA,
+        'c': GL.CONSTANT_COLOR, '(1-c)': GL.ONE_MINUS_CONSTANT_COLOR,
+        'ca': GL.CONSTANT_ALPHA, '(1-ca)': GL.ONE_MINUS_CONSTANT_ALPHA,
+    };
+    const res = {s:GL.ZERO, d:GL.ZERO, f:null};
+    s = s.replace(/(s|d)(?:\*(\w+|\(1-\w+\)))?/g, (_,term,factor)=>{
+        factor = factor||'1';
+        if (!(factor in factor2gl)) {
+            throw `Unknown blend factor: "${factor}"`;
+        }
+        res[term] = factor2gl[factor];
+        return term;
+    });
+    let m;
+    if (m=s.match(/^(min|max)\((s,d|d,s)\)$/)) {
+        res.f = func2gl[m[1]];
+    } else if (s.match(/^(s|d|s\+d|d\+s)$/)) {
+        res.f = func2gl['+'];
+    } else if (s in func2gl) {
+        res.f = func2gl[s];
+    } else {
+        throw `Unable to parse blend spec: "${s0}"`;
+    }
+    return res;
+}
+parseBlend = memoize(parseBlend);
+
+function compileShader(gl, code, type, program) {
+    code = '#version 300 es\n'+code;
+    const shader = gl.createShader(type);
+    gl.shaderSource(shader, code);
+    gl.compileShader(shader);
+    if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+        const withLines = code.split('\n').map(
+            (s, i)=>`${(i+1+'').padStart(4)}: ${s}`).join('\n')
+        throw (withLines+'\n'+'--- GLSL COMPILE ERROR ---\n'+ gl.getShaderInfoLog(shader));
+    }
+    gl.attachShader(program, shader);
+    gl.deleteShader(shader);
+}
+
+function compileProgram(gl, vs, fs) {
+    const program = gl.createProgram();
+    compileShader(gl, vs, gl.VERTEX_SHADER, program);
+    compileShader(gl, fs, gl.FRAGMENT_SHADER, program);
+    gl.linkProgram(program);
+    if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+        console.error("shader link error:" + gl.getProgramInfoLog(program));
+    }
+    gl.useProgram(program);
+    program.setters = {};
+    program.samplers = [];
+    const numUniforms = gl.getProgramParameter(program, gl.ACTIVE_UNIFORMS);
+    for (let i = 0; i < numUniforms; ++i) {
+        const info = gl.getActiveUniform(program, i);
+        const loc = gl.getUniformLocation(program, info.name);
+        if (info.type==gl.SAMPLER_2D || info.type==gl.SAMPLER_2D_ARRAY) {
+            gl.uniform1i(loc, program.samplers.length);
+            program.samplers.push(info);
+        } else {
+            const fname = Type2Setter[info.type];
+            const setter = fname.startsWith('uniformMatrix') ?
+                v=>gl[fname](loc, false, v) : v=>gl[fname](loc, v);
+            program.setters[info.name.match(/^\w+/)[0]] = setter;
+
+        }
+    }
+    gl.useProgram(null);
+    console.log('created', program);
+    return program;
+}
+
+const glsl_template = `
+precision highp float;
+precision highp int;
+precision lowp sampler2DArray;
+#ifdef VERT
+    #define varying out
+    #define VPos gl_Position
+    layout(location = 0) in int VertexID;
+    layout(location = 1) in int InstanceID;
+    ivec2 VID;
+    ivec3 ID;
+#else
+    #define varying in
+    layout(location = 0) out vec4 FOut;
+    layout(location = 1) out vec4 FOut1;
+    layout(location = 2) out vec4 FOut2;
+    layout(location = 3) out vec4 FOut3;
+    layout(location = 4) out vec4 FOut4;
+    layout(location = 5) out vec4 FOut5;
+    layout(location = 6) out vec4 FOut6;
+    layout(location = 7) out vec4 FOut7;
+    ivec2 I;
+#endif
+
+uniform ivec3 Grid;
+uniform ivec2 Mesh;
+uniform ivec4 View;
+#define ViewSize (View.zw)
+uniform vec2 Aspect;
+varying vec2 UV;
+#define XY (2.0*UV-1.0)
+// #define VertexID gl_VertexID
+// #define InstanceID gl_InstanceID
+
+
+//////// GLSL Utils ////////
+
+const float PI  = radians(180.0);
+const float TAU = radians(360.0);
+
+// source: https://www.shadertoy.com/view/XlXcW4
+// TODO more complete hash library
+vec3 hash( ivec3 ix ) {
+    uvec3 x = uvec3(ix);
+    const uint k = 1103515245U;
+    x = ((x>>8U)^x.yzx)*k;
+    x = ((x>>8U)^x.yzx)*k;
+    x = ((x>>8U)^x.yzx)*k;
+    return vec3(x)*(1.0/float(0xffffffffU));
+}
+
+mat2 rot2(float a) {
+  float s=sin(a), c=cos(a);
+  return mat2(c, s, -s, c);
+}
+
+// https://suricrasia.online/demoscene/functions/
+vec3 erot(vec3 p, vec3 ax, float ro) {
+    return mix(dot(ax, p)*ax, p, cos(ro)) + cross(ax,p)*sin(ro);
+}
+
+vec3 uv2sphere(vec2 uv) {
+  uv *= vec2(-TAU,PI);
+  return vec3(vec2(cos(uv.x), sin(uv.x))*sin(uv.y), cos(uv.y));
+}
+
+vec3 torus(vec2 uv, float r1, float r2) {
+    uv *= TAU;
+    vec3 p = vec3(r1+cos(uv.x)*r2, 0, sin(uv.x)*r2);
+    return vec3(p.xy * rot2(uv.y), p.z);
+}
+
+vec3 cubeVert(vec2 xy, int side) {
+    float x=xy.x, y=xy.y;
+    switch (side) {
+        case 0: return vec3(x,y,1); case 1: return vec3(y,x,-1);
+        case 2: return vec3(y,1,x); case 3: return vec3(x,-1,y);
+        case 4: return vec3(1,x,y); case 5: return vec3(-1,y,x);
+    };
+    return vec3(0.0);
+}
+
+vec3 _surf_f(vec3 p, vec3 a, vec3 b, out vec3 normal) {
+    normal = normalize(cross(a-p, b-p));
+    return p;
+}
+#define SURF(f, uv, out_normal, eps) _surf_f(f(uv), f(uv+vec2(eps,0)), f(uv+vec2(0,eps)), out_normal)
+
+vec4 _sample(sampler2D tex, vec2 uv) {return texture(tex, uv);}
+vec4 _sample(sampler2D tex, ivec2 xy) {return texelFetch(tex, xy, 0);}
+vec4 _sample(sampler2DArray tex, vec3 uv) {return texture(tex, uv);}
+vec4 _sample(sampler2DArray tex, ivec3 xy) {return texelFetch(tex, xy, 0);}
+
+#ifdef FRAG
+    float isoline(float v) {
+        float distToInt = abs(v-round(v));
+        return smoothstep(max(fwidth(v), 0.0001), 0.0, distToInt);
+    }
+    float wireframe() {
+        vec2 m = UV*vec2(Mesh);
+        float d1 = isoline(m.x-m.y), d2 = isoline(m.x+m.y);
+        float d = mix(d1, d2, float(int(m.y)%2));
+        return isoline(m.x)+isoline(m.y)+d;
+    }
+#endif
+`;
+
+function guessUniforms(params) {
+    const uni = [];
+    const len2type = {1:'float', 2:'vec2', 3:'vec3', 4:'vec4', 9:'mat3', 16:'mat4'};
+    for (const name in params) {
+        const v = params[name];
+        let s = null;
+        if (v instanceof WebGLTexture) {
+            const [type, D] = v.layern?['sampler2DArray', '3']:['sampler2D', '2'];
+            s = `uniform ${type} ${name};
+            #define ${name}(p) (_sample(${name}, (p)))
+            ivec${D} ${name}_size() {return textureSize(${name}, 0);}
+            vec${D}  ${name}_step() {return 1.0/vec${D}(${name}_size());}`;
+        } else if (typeof v === 'number') {
+            s=`uniform float ${name};`
+        } else  if (v.length in len2type) {
+            s=`uniform ${len2type[v.length]} ${name};`
+        }
+        if (s) uni.push(s);
+    }
+    return uni.join('\n')+'\n';
+}
+
+const stripComments = code=>code.replace(/\/\*[\s\S]*?\*\/|\/\/.*/g,'');
+
+// TODO better parser (use '\b')
+function definedUniforms(code) {
+    code = stripComments(code);
+    const lines = Array.from(code.matchAll(/uniform\s+\w+\s+([^;]+)\s*;/g));
+    return new Set(lines.map(m=>m[1].split(/[^\w]+/)).flat());
+}
+
+function expandCode(code, mainFunc, outVar) {
+    const stripped = stripComments(code).trim();
+    if (stripped != '' && stripped.indexOf(';') == -1) {
+        code = `${outVar} = vec4(${stripped});`
+    }
+    if (!stripped.match(new RegExp(`\\b${mainFunc}\s*\\(`))) {
+        code = `void ${mainFunc}() {
+          ${code};
+        }`
+    }
+    return code;
+}
+const expandVP = memoize(code=>expandCode(code, 'vertex', 'VPos'));
+const expandFP = memoize(code=>expandCode(code, 'fragment', 'FOut'));
+
+function linkShader(gl, uniforms, Inc, VP, FP) {
+    const defined = definedUniforms([glsl_template, Inc, VP, FP].join('\n'));
+    const undefined = Object.entries(uniforms)
+        .filter(kv=>kv[0].match(/^\w+$/))
+        .filter(kv=>!(defined.has(kv[0])));
+    const guessed = guessUniforms(Object.fromEntries(undefined));
+    const prefix = `${glsl_template}\n${Inc}\n${guessed}`;
+    return compileProgram(gl, `
+    #define VERT
+    ${prefix}\n${expandVP(VP)}
+    void main() {
+      int rowVertN = Mesh.x*2+3;
+      int rowI = VertexID/rowVertN;
+      int rowVertI = min(VertexID%rowVertN, rowVertN-2);
+      int odd = rowI%2;
+      if (odd==0) rowVertI = rowVertN-rowVertI-2;
+      VID = ivec2(rowVertI>>1, rowI + (rowVertI+odd+1)%2);
+      int ii = InstanceID;
+      ID.x = ii % Grid.x; ii/=Grid.x;
+      ID.y = ii % Grid.y; ii/=Grid.y;
+      ID.z = ii;
+      UV = vec2(VID) / vec2(Mesh);
+      VPos = vec4(XY,0,1);
+      vertex();
+      VPos.xy *= Aspect;
+    }`, `
+    #define FRAG
+    ${prefix}\n${expandFP(FP)}
+    void main() {
+      I = ivec2(gl_FragCoord.xy);
+      fragment();
+    }`);
+}
+
+function createTex2D(gl, params) {
+    let {size, format='rgba8', filter='linear', wrap='repeat', layern=null, data=null, depth=null} = params;
+    if (format.includes('+')) {
+        const [mainFormat, depthFormat] = format.split('+');
+        const tex = createTex2D(gl, {...params, format:mainFormat});
+        tex.depth = createTex2D(gl, {...params, format:depthFormat, layern:null, depth:null});
+        return tex;
+    }
+    const gltarget = layern ? gl.TEXTURE_2D_ARRAY : gl.TEXTURE_2D;
+    const [internalFormat, glformat, type] = {
+        'r8': [gl.R8, gl.RED, gl.UNSIGNED_BYTE],
+        'rgba8': [gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE],
+        'r16f': [gl.R16F, gl.RED, gl.FLOAT],
+        'rgba16f': [gl.RGBA16F, gl.RGBA, gl.FLOAT],
+        'r32f': [gl.R32F, gl.RED, gl.FLOAT],
+        'rgba32f': [gl.RGBA32F, gl.RGBA, gl.FLOAT],
+        'depth': [gl.DEPTH_COMPONENT24, gl.DEPTH_COMPONENT, gl.UNSIGNED_INT],
+    }[format];
+    // TODO: mipmap
+    if (format == 'depth') {
+        filter = 'nearest';
+    }
+    const glfilter = { 'nearest': gl.NEAREST, 'linear': gl.LINEAR}[filter];
+    const glwrap = {'repeat': gl.REPEAT, 'edge': gl.CLAMP_TO_EDGE,
+                    'mirror': gl.MIRRORED_REPEAT}[wrap];
+    const tex = gl.createTexture();
+    tex.format = format;
+    tex.layern = layern;
+    tex.gltarget = gltarget;
+    if (depth) {tex.depth = depth;}
+    tex.update = (size, data)=> {
+        const [w, h] = size;
+        gl.bindTexture(gltarget, tex);
+        if (!layern) {
+            gl.texImage2D(gltarget, 0/*mip level*/,
+                internalFormat, w, h, 0/*border*/,
+                glformat, type, data/*data*/);
+        } else {
+            gl.texImage3D(gltarget, 0/*mip level*/,
+                internalFormat, w, h, layern, 0/*border*/,
+                glformat, type, data/*data*/);
+        }
+        gl.bindTexture(gltarget, null);
+        tex.size = size;
+        if (tex.depth) {tex.depth.update(size, data);}
+    }
+    tex.update(size, data);
+
+    gl.bindTexture(gltarget, tex);
+    // TODO: gl.generateMipmap(gltarget); ?
+    gl.texParameteri(gltarget, gl.TEXTURE_MIN_FILTER, glfilter);
+    gl.texParameteri(gltarget, gl.TEXTURE_MAG_FILTER, glfilter);
+    gl.texParameteri(gltarget, gl.TEXTURE_WRAP_S, glwrap);
+    gl.texParameteri(gltarget, gl.TEXTURE_WRAP_T, glwrap);
+    gl.bindTexture(gltarget, null);
+    return tex;
+}
+
+function createTex(gl, params) {
+    const story = params.story || 1;
+    const textures = [];
+    for (let i=0; i<story; ++i){
+        textures.push(createTex2D(gl, params));
+    }
+    const res = story > 1 ? textures : textures[0];
+    console.log('created', res);
+    return res;
+}
+
+
+function calcAspect(aspect, w, h) {
+    if (!aspect) return [1,1];
+    let c;
+    switch (aspect) {
+        case 'fit':   c = Math.min(w, h); break;
+        case 'cover': c = Math.max(w, h); break;
+        case 'x':     c = w; break;
+        case 'y':     c = h; break;
+        case 'mean':  c = (w+h)/2; break;
+        default: throw `Unknown aspect mode "${aspect}"`;
+    }
+    return [c/w, c/h];
+}
+
+function ensureVertexArray(gl, neededSize) {
+    // gl_VertexID / gl_InstanceID seem to be broken in some configurations
+    // (e.g. https://crbug.com/1315104), so I had to fallback to using arrays
+    if (gl._indexVA && neededSize <= gl._indexVA.size)
+        return;
+    const size = neededSize*2;
+    
+    const va = gl._indexVA || gl.createVertexArray();
+    va.size = size;
+    gl._indexVA = va;
+    gl.bindVertexArray(va);
+    
+    const arr = new Int32Array(size);
+    arr.forEach((v, i)=>{arr[i] = i});
+    
+    const buf = va.buf || gl.createBuffer();
+    va.buf = buf;
+    gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+    gl.bufferData(gl.ARRAY_BUFFER, arr, gl.STATIC_DRAW);
+    
+    for (let loc=0; loc<2; ++loc) {
+        gl.enableVertexAttribArray(loc);
+        gl.vertexAttribIPointer(loc, 1/*size*/, gl.INT,
+            false/*normalize*/, 0/*stride*/, 0/*offset*/);
+    }
+    gl.vertexAttribDivisor(1, 1);
+    
+    gl.bindBuffer(gl.ARRAY_BUFFER, null);
+    gl.bindVertexArray(null);
+
+    console.log('created:', va);
+}
+
+function isTargetSpec(target) {
+    return !(!target ||  // canvas
+        (target instanceof WebGLTexture) || Array.isArray(target) || (target.fbo !== undefined));
+}
+
+function getTargetSize(gl, {size, scale=1}) {
+    size = size || [gl.canvas.width, gl.canvas.height];
+    return [Math.round(size[0]*scale), Math.round(size[1]*scale)];
+}
+
+function prepareOwnTarget(self, spec) {
+    if (!spec.tag) {
+        throw 'target must have a tag';
+    }
+    const buffers = self.buffers;
+    spec.size = getTargetSize(self.gl, spec);
+    if (!buffers[spec.tag]) {
+        buffers[spec.tag] = createTex(self.gl, spec);
+    } else {
+        const target = buffers[spec.tag];
+        const tex = Array.isArray(target) ? target[target.length-1] : target;
+        const needResize = tex.size[0] != spec.size[0] || tex.size[1] != spec.size[1];
+        if (needResize || spec.data) {
+            if (needResize) {
+                console.log(`resized tex (${tex.size})->(${spec.size})`);
+            }
+            tex.update(spec.size, spec.data);
+        }
+    }
+    return buffers[spec.tag];
+}
+
+function attachTex(gl, tex) {
+    if (!tex.layern) {
+        const attachment = tex.format == 'depth' ? gl.DEPTH_ATTACHMENT : gl.COLOR_ATTACHMENT0;
+        gl.framebufferTexture2D(
+            gl.FRAMEBUFFER, attachment, gl.TEXTURE_2D, tex, 0/*level*/);
+    } else {
+        const drawBuffers = [];
+        for (let i=0; i<tex.layern; ++i) {
+            const attachment = gl.COLOR_ATTACHMENT0+i;
+            drawBuffers.push(attachment);
+            gl.framebufferTextureLayer(
+                gl.FRAMEBUFFER, attachment, tex, 0/*level*/, i);
+        }
+        gl.drawBuffers(drawBuffers);
+    }
+}
+
+function bindTarget(gl, tex) {
+    if (tex && (tex.fbo===undefined)) {
+        tex.fbo = gl.createFramebuffer();
+        gl.bindFramebuffer(gl.FRAMEBUFFER, tex.fbo);
+        attachTex(gl, tex);
+        if (tex.depth) attachTex(gl, tex.depth);
+    } else {
+        const fbo = tex ? tex.fbo : null;
+        gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+
+    }
+    return tex ? tex.size : [gl.canvas.width, gl.canvas.height];
+}
+
+const OptNames = new Set([
+    'Inc', 'VP', 'FP',
+    'Clear', 'Blend', 'View', 'Grid', 'Mesh', 'Aspect', 'DepthTest', 'AlphaCoverage', 'Face'
+]);
+
+function drawQuads(self, params, target) {
+    const options={}, uniforms={}
+    for (const p in params) {
+        (OptNames.has(p)?options:uniforms)[p] = params[p];
+    }
+    const [Inc, VP, FP] = [options.Inc||'', options.VP||'', options.FP||''];
+    const emptyShader = !VP && !FP;
+    const shaderID = Inc+VP+FP;
+
+    // setup target
+    if (isTargetSpec(target)) {
+        target = prepareOwnTarget(self, target);
+    }
+    let targetTexture = target;
+    if (Array.isArray(target)) {
+        uniforms.Src = uniforms.Src || target[0];
+        target.unshift(target.pop());
+        targetTexture = target[0];
+    }
+
+    // bind (and clear) target
+    if (options.Clear === undefined && emptyShader) {
+        return target;
+    }
+    const gl = self.gl;
+    const targetSize = bindTarget(gl, targetTexture);
+    let view = options.View || [0, 0, targetSize[0], targetSize[1]];
+    if (view.length == 2) {
+        view = [0, 0, view[0], view[1]]
+    }
+    gl.depthMask(!(options.DepthTest == 'keep'));
+    if (options.Clear !== undefined) {  // can be 0.0
+        let clear = options.Clear;
+        if (typeof clear === 'number') {
+            clear = [clear, clear, clear, clear];
+        }
+        gl.clearColor(...clear);
+        gl.enable(gl.SCISSOR_TEST);
+        gl.scissor(...view);
+        gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+        gl.disable(gl.SCISSOR_TEST);
+    }
+
+    // setup program
+    if (emptyShader) {
+        return target;
+    }
+    if (!(shaderID in self.shaders)) {
+        self.shaders[shaderID] = linkShader(gl, uniforms, Inc, VP, FP);
+    }
+    const prog = self.shaders[shaderID];
+    gl.useProgram(prog);
+    
+    // process options
+    if (options.Blend) {
+        const blend = parseBlend(options.Blend);
+        const {s, d, f}=blend;
+        gl.enable(gl.BLEND);
+        gl.blendFunc(s, d);
+        gl.blendEquation(f);
+    }
+    if (options.DepthTest) {
+        gl.enable(gl.DEPTH_TEST);
+    }
+    if (options.Face) {
+        gl.enable(gl.CULL_FACE);
+        const mode = {'front':gl.BACK, 'back':gl.FRONT}[options.Face];
+        gl.cullFace(mode);
+    }
+    if (options.AlphaCoverage) {
+        gl.enable(gl.SAMPLE_ALPHA_TO_COVERAGE);
+    }
+
+    // View, Aspect
+    gl.viewport(...view)
+    const width=view[2], height=view[3];
+    uniforms.View = view;
+    uniforms.Aspect = calcAspect(options.Aspect, width, height);
+
+    // Grid, Mesh
+    const [gx=1, gy=1, gz=1] = options.Grid || [];
+    uniforms.Grid = [gx, gy, gz];
+    uniforms.Mesh = options.Mesh || [1, 1]; // 3d for cube?
+    const vertN = (uniforms.Mesh[0]*2+3)*uniforms.Mesh[1]-1;
+    const instN = gx*gy*gz;
+    ensureVertexArray(gl, Math.max(vertN, instN));
+    gl.bindVertexArray(gl._indexVA);
+
+    // setup uniforms and textures
+    for (const name in uniforms) {
+        const val = uniforms[name];
+        if (name in prog.setters) {
+            prog.setters[name](val);
+        }
+    }
+    for (let i=0; i<prog.samplers.length; ++i) {
+        const tex = uniforms[prog.samplers[i].name];
+        gl.activeTexture(gl.TEXTURE0+i);
+        gl.bindTexture(tex?tex.gltarget:gl.TEXTURE_2D, tex);
+        //gl.bindSampler(i, null); //TODO: sampler
+    }
+    
+    // draw
+    gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, vertN, instN);
+    
+    // revert gl state
+    if (options.Blend) gl.disable(gl.BLEND);
+    if (options.DepthTest) gl.disable(gl.DEPTH_TEST);
+    if (options.Face) gl.disable(gl.CULL_FACE);
+    if (options.AlphaCoverage) gl.disable(gl.SAMPLE_ALPHA_TO_COVERAGE);
+
+    gl.bindVertexArray(null);
+    return target;
+}
+
+function wrapSwissGL(hook) {
+    const glsl = this;
+    const f = (params, target)=>hook(glsl, params, target);
+    f.hook = wrapSwissGL;
+    f.gl = glsl.gl;
+    return f;
+}
+
+function SwissGL(canvas_gl) {
+    const gl = canvas_gl.getContext ?
+        canvas_gl.getContext('webgl2', {alpha:false, antialias:true}) : canvas_gl;
+    gl.getExtension("EXT_color_buffer_float");
+    gl.getExtension("OES_texture_float_linear");
+    ensureVertexArray(gl, 1024);
+    const glsl = (params, target)=>drawQuads(glsl, params, target);
+    glsl.hook = wrapSwissGL;
+    
+    glsl.gl = gl;
+    glsl.shaders = {};
+    glsl.buffers = {};
+
+    const releaseTarget = target=>{
+        if (target.fbo) gl.deleteFramebuffer(target.fbo);
+        gl.deleteTexture(target);
+    }
+    glsl.reset = ()=>{
+        Object.values(glsl.shaders).forEach(
+            prog=>gl.deleteProgram(prog));
+        Object.values(glsl.buffers).forEach(target=>{
+            if (Array.isArray(target)) {
+                target.forEach(releaseTarget);
+            } else {
+                releaseTarget(target);
+            }
+        });
+        glsl.shaders = {};
+        glsl.buffers = {};
+    };
+    return glsl;
+}
+
+self._SwissGL = SwissGL;</script>
+<script>// https://www.karlsims.com/rd.html
+class ReactionOrchestra {
+    static Tags = ['3d', 'simulation'];
+    
+    frame(glsl, params) {
+        const common = `
+        vec3 grid2wld(vec2 p, vec2 s) {
+            vec3 pos = vec3((p-0.5)*1.8, s.y*0.3);
+            if (xrMode) {
+                pos = uv2sphere((p-0.5)*vec2(0.3, 0.5)+0.5)*(8.0-s.y*6.);
+                pos.x += 1.0;
+                pos.z *= 1.2;
+            }
+            return pos;
+        }`;
+
+        const step_n = 2;
+        for (let i=0; i<step_n; ++i)
+        this.state = glsl({k:0.05069, f: 0.01935, FP:`
+        FOut = Src(I);
+        if (FOut.w == 0.0) {
+            float v = smoothstep(0.03, 0.0, length(XY));
+            FOut += vec4(1.0-v,v,0,1);
+            return;
+        }
+        vec2 dp = Src_step();
+        float x=UV.x, y=UV.y;
+        float l=x-dp.x, r=x+dp.x, u=y-dp.y, d=y+dp.y;
+        #define S(x,y) (Src(vec2(x,y)).xy)
+        vec2 diff = (FOut.xy+S(l,y)+S(r,y)+S(x,u)+S(x,d)+S(l,u)+S(r,u)+S(l,d)+S(r,d))/9.0;
+        FOut.xy += (diff-FOut.xy)*vec2(1.0, 0.5);
+        float s = FOut.x*FOut.y*FOut.y;
+        FOut.xy += vec2(f*(1.0-FOut.x)-s, s-(f+k)*FOut.y);
+        `}, {size:[320, 320], story:2, format:'rgba16f', tag:'state', wrap:'mirror'});
+
+        if (params.xrMode && (params.xrButton[0] || params.xrButton[4]))
+        glsl({...params, Inc:common, FP:`
+        FOut = Src(I);
+        vec3 pos = grid2wld(UV, vec2(0));
+        for (int i=0; i<2; ++i) {
+            if (xrButton[i].x<0.5) continue;    
+            float s = 1.0+normalize((xrRayInv[i]*vec4(pos, 1)).xyz).z;
+            float v = smoothstep(0.003, 0.0, s)*0.5;
+            FOut.xy = mix(FOut.xy, vec2(1.0-v,v), v);
+        }
+        `}, this.state);
+
+        const grad = glsl({S:this.state[0], FP:`
+        vec3 d = vec3(S_step(), 0.0);
+        FOut = vec4(S(UV+d.xz).y-S(UV-d.xz).y, S(UV+d.zy).y-S(UV-d.zy).y, 0, 0);
+        `}, {size:this.state[0].size, format:'rgba16f', tag:'grad'});
+
+        const [w, h] = this.state[0].size;
+        glsl({...params, state:this.state[0], grad,
+            Mesh:[w/2, h/2], Aspect:'mean', DepthTest:1, Inc: common+`
+        varying vec3 color;`, VP:`
+        vec2 p = UV;
+        p.x -= float(VID.y%2)/float(Mesh.x)*0.5;
+        vec2 s=state(p).xy+0.0, g=grad(p).xy;
+        color = vec3(s.y, length(g), s.y)*1.5;
+        vec3 pos = grid2wld(p-0.1*g, s);
+        if (xrMode) {
+            for (int i=0; i<2; ++i) {
+                //if (xrButton[i].x<0.5) continue;    
+                float s = 1.0+normalize((xrRayInv[i]*vec4(pos, 1)).xyz).z;
+                if (s<0.003 ) color += smoothstep(0.003, 0.0, s)*0.2;
+            }
+        }
+        VPos = wld2proj(pos);`, FP:`
+        float w = max(wireframe()-1.0, 0.0)*0.5;
+        FOut = vec4(mix(color, vec3(1), w*color.r), 1.0);
+        `});
+    }
+}
+</script>
+<script>'use strict';
+
+const $ = s=>document.querySelector(s);
+const setDisplay = (el, val)=>{if ($(el)) $(el).style.display = val};
+
+
+class DemoApp {
+    constructor(demos, defaultDemo='ParticleLife3d') {
+        this.singleMode = demos.length == 1;
+        if (this.singleMode) {
+            defaultDemo = demos[0].name;
+        }
+        this.demos = Object.fromEntries(demos.map(c=>[c.name, c]));
+
+        this.canvas = document.getElementById('c');
+        const gl = this.canvas.getContext('webgl2', {alpha:false, antialias:true,
+            xrCompatible:true});
+        this.glsl = SwissGL(gl);
+        this.demo = null;
+        this.gui = null;
+
+        this.xrDemos =  Object.values(this.demos).filter(f=>f.Tags&&f.Tags.includes('3d'));
+        this.xrSession = null;
+        this.xrRefSpace = null;
+        this.xrPose = null;
+        this.lookUpStartTime = 0;
+        this.haveVR = this.haveAR = false;
+        if (navigator.xr) {
+            navigator.xr.isSessionSupported('immersive-vr').then(supported=>{
+                this.haveVR = supported;
+                this.updateVRButtons();
+            })
+            navigator.xr.isSessionSupported('immersive-ar').then(supported=>{
+                this.haveAR = supported;
+                this.updateVRButtons();
+            })
+        }
+
+        this.viewParams = {
+            canvasSize: new Float32Array(2),
+            pointer: new Float32Array(3),
+            cameraYPD: new Float32Array(3),
+            xrRay: new Float32Array(16*2),
+            xrRayInv: new Float32Array(16*2),
+            xrButton: new Float32Array(4*2),
+        };
+        this.resetCamera();
+
+        this.glsl_include = `
+            uniform bool xrMode;
+            uniform mat4 xrProjectionMatrix, xrViewMatrix;
+            uniform mat4 xrRay[2], xrRayInv[2];
+            uniform vec4 xrButton[2];
+            uniform vec3 xrPosition;
+            
+            uniform vec3 cameraYPD;
+            vec3 cameraPos() {
+                if (xrMode) return xrPosition;
+                vec3 p = vec3(0, 0, cameraYPD.z);
+                p.yz *= rot2(-cameraYPD.y);
+                p.xy *= rot2(-cameraYPD.x);
+                return p;
+            }
+            vec4 wld2view(vec4 p) {
+                if (xrMode) return xrViewMatrix * p;
+                p.xy *= rot2(cameraYPD.x);
+                p.yz *= rot2(cameraYPD.y);
+                p.z -= cameraYPD.z;
+                return p;
+            }
+            vec4 view2proj(vec4 p) {
+                if (xrMode) return xrProjectionMatrix*p;
+                const float near = 0.1, far = 10.0, fov = 1.0;
+                return vec4(p.xy/tan(fov/2.0),
+                    (p.z*(near+far)+2.0*near*far)/(near-far), -p.z);
+            }
+            vec4 wld2proj(vec4 p) {
+                return view2proj(wld2view(p));
+            }
+            vec4 wld2proj(vec3 p) {
+                return wld2proj(vec4(p,1.0));
+            }
+        `;
+        this.withCamera = this.glsl.hook((glsl, params, target)=>{
+            params = {...params, Inc:this.glsl_include+(params.Inc||'')};
+            if (target || !params.xrMode) {
+                return glsl(params, target);
+            }
+            delete params.Aspect;
+            let glLayer = this.xrSession.renderState.baseLayer;
+            target = {size: [glLayer.framebufferWidth, glLayer.framebufferHeight],
+                fbo: glLayer.framebuffer};
+            for (let view of this.xrPose.views) {
+                const vp = glLayer.getViewport(view);
+                params.View = [vp.x, vp.y, vp.width, vp.height];
+                params.xrProjectionMatrix = view.projectionMatrix;
+                params.xrViewMatrix = view.transform.inverse.matrix;
+                let {x,y,z} = view.transform.position;
+                params.xrPosition = [x, y, z];
+                glsl(params, target);
+            }
+        });
+
+        const setPointer = (e, buttons)=>{
+            const [w, h] = this.viewParams.canvasSize;
+            const [x, y] = [e.offsetX-w/2, h/2-e.offsetY];
+            this.viewParams.pointer.set([x, y, buttons]);
+            return [x, y];
+        };
+        this.canvas.addEventListener('pointerdown', e=>{
+            if (!e.isPrimary) return;
+            setPointer(e, e.buttons);
+            if (window.innerWidth < 500) {
+                // close menu on small screens
+                $('#panel').removeAttribute("open");
+            }
+        });
+        this.canvas.addEventListener('pointerout', e=>setPointer(e, 0));
+        this.canvas.addEventListener('pointerup', e=>setPointer(e, 0));
+        this.canvas.addEventListener('pointermove', e=>{
+            const [px, py, _] = this.viewParams.pointer;
+            const [x, y] = setPointer(e, e.buttons);
+            if (!e.isPrimary || e.buttons != 1) return;
+            let [yaw, pitch, dist] = this.viewParams.cameraYPD;
+            yaw -= (x-px)*0.01;
+            pitch += (y-py)*0.01;
+            pitch = Math.min(Math.max(pitch, 0), Math.PI);
+            this.viewParams.cameraYPD.set([yaw, pitch, dist]);
+        });
+
+        let name = location.hash.slice(1);
+        if (!(name in this.demos)) {
+            name = defaultDemo;
+        }
+        this.runDemo(name);
+        this.populatePreviews();
+
+        requestAnimationFrame(this.frame.bind(this));
+    }
+
+    resetCamera() {
+        this.viewParams.cameraYPD.set([Math.PI*3/4, Math.PI/4, 1.8]);
+    }
+
+    frame(t) {
+        requestAnimationFrame(this.frame.bind(this));
+        if (this.xrSession) return; // skip canvas frames when XR is running
+        this.adjustCanvas();
+        
+        this.demo.frame(this.withCamera, {
+            time:t/1000.0, xrMode: false,
+            ...this.viewParams,
+        });
+    }
+
+    xrFrame(t, xrFrame) {
+        this.xrSession.requestAnimationFrame(this.xrFrame.bind(this));
+        this.xrPose = xrFrame.getViewerPose(this.xrRefSpace);
+        if (!this.xrPose) return;
+        this.viewParams.xrRay.fill(0.0);
+        this.viewParams.xrRayInv.fill(0.0);
+        this.viewParams.xrButton.fill(0.0);
+        const params = {time:t/1000.0, xrMode: true, ...this.viewParams};
+        for (let i=0; i<2; ++i) {
+            const inputSource = this.xrSession.inputSources[i];
+            inputSource?.gamepad?.buttons?.forEach((btn, btnIdx)=>{
+                if (btnIdx<4) this.viewParams.xrButton[i*4+btnIdx] = btn.value || btn.pressed;
+            });
+            if (!inputSource?.targetRaySpace) continue;
+            const pose = xrFrame.getPose(inputSource.targetRaySpace, this.xrRefSpace);
+            if (!pose) continue;
+            this.viewParams.xrRay.set(pose.transform.matrix, i*16);
+            this.viewParams.xrRayInv.set(pose.transform.inverse.matrix, i*16);
+        }
+        
+        this.demo.frame(this.withCamera, params);
+        this.withCamera({...params, Mesh: [20,20], Grid:[2], DepthTest:1, Inc:`
+            varying vec3 p;
+            varying vec4 buttons;`, VP:`
+            p = uv2sphere(UV);
+            buttons = xrButton[ID.x];
+            VPos = wld2proj(xrRay[ID.x]*vec4(p*vec3(0.02, 0.02, 0.1),1));`, FP:`
+            vec3 c = p*0.5+0.5;
+            FOut = vec4(c*0.5,1);
+            float b = c.z*4.0;
+            if (b<4.0 && buttons[int(b)]>fract(b)) FOut += 0.5;`});
+
+        const lookUpCoef = -this.xrPose.transform.matrix[10];
+        if (!this.singleMode && (lookUpCoef>0.5)) {
+            const dt = (t-this.lookUpStartTime) / 1000;
+            if (dt > 1) {
+                this.lookUpStartTime = t;
+                let i = this.xrDemos.indexOf(this.demo.constructor);
+                i = (i+1)%this.xrDemos.length;
+                this.runDemo(this.xrDemos[i].name);
+            } else {
+                this.withCamera({...params, Mesh: [20,20], dt, DepthTest:1, VP:`
+                vec3 p = uv2sphere(UV)*0.6*clamp(1.0-dt, 0.0, 0.8) + vec3(-2.0, 0.0, 3.0);
+                VPos = wld2proj(vec4(p,1));`, FP:`UV,0.5,1`});
+            }
+        } else {
+            this.lookUpStartTime = t;
+        }
+    }
+
+    toggleXR(xr) {
+        if (!this.xrSession) {
+            navigator.xr.requestSession(`immersive-${xr}`).then(session=>{
+                this.xrSession = session;
+                session.addEventListener('end', ()=>{this.xrSession = null;});
+                session.updateRenderState({ baseLayer: new XRWebGLLayer(session, this.glsl.gl) });
+                session.requestReferenceSpace('local').then((refSpace) => {
+                    this.xrRefSpace = refSpace.getOffsetReferenceSpace(
+                        new XRRigidTransform({x:0,y:-0.25,z:-1.0,w:1},   // position offset
+                                             {x:0.5,y:0.5,z:0.5,w:-0.5}) // rotate z up
+                    );
+                    session.requestAnimationFrame(this.xrFrame.bind(this));
+                  });
+            });
+        } else {
+            this.xrSession.end();
+        }
+    }
+
+    runDemo(name) {
+        if (this.demo) {
+            if (this.gui) this.gui.destroy();
+            if (this.demo.free) this.demo.free();
+            this.glsl.reset();
+            this.demo = this.gui = null;
+        }
+        if (!this.singleMode) location.hash = name;
+        if (self.dat) {
+            this.gui = new dat.GUI();
+            this.gui.domElement.id = 'gui'
+            this.gui.hide();
+        }
+        this.demo = new this.demos[name](this.withCamera, this.gui);
+        if (this.gui?.__controllers.length == 0) {
+            if (this.gui) this.gui.destroy();
+            this.gui = null;
+        }
+        setDisplay('#settingButton', this.gui?'block':'none');
+        if ($('#sourceLink')) {
+            $('#sourceLink').href = `https://github.com/google/swissgl/blob/main/demo/${name}.js`;
+        }
+        this.updateVRButtons();
+        this.resetCamera();
+    }
+
+    updateVRButtons() {
+        setDisplay('#vrButton', 'none');
+        setDisplay('#arButton', 'none');
+        const tags = this.demo && this.demo.constructor.Tags;
+        if (tags && tags.includes('3d')) {
+            if (this.haveVR ) setDisplay('#vrButton', 'block');
+            if (this.haveAR ) setDisplay('#arButton', 'block');
+        }
+    }
+
+    populatePreviews() {
+        const panel = document.getElementById('cards');
+        if (!panel) return;
+        Object.keys(this.demos).forEach(name=>{
+            const el = document.createElement('div');
+            el.classList.add('card');
+            el.innerHTML = `<img src="demo/preview/${name}.jpg">${name}`;
+            el.addEventListener('click', ()=>this.runDemo(name));
+            panel.appendChild(el);
+        });
+    }
+
+    adjustCanvas() {
+        const {canvas} = this;
+        const dpr = 1;//devicePixelRatio;
+        this.viewParams.canvasSize.set([canvas.clientWidth, canvas.clientHeight]);
+        const w = canvas.clientWidth*dpr, h=canvas.clientHeight*dpr;
+        if (canvas.width != w || canvas.height != h) {
+            canvas.width = w; canvas.height = h;
+        }
+    }
+
+    // helper function to render demo preview images
+    genPreviews() {
+        const panel = document.getElementById('cards');
+        panel.innerHTML = '';
+        const canvas = document.createElement('canvas');
+        canvas.width = 400; canvas.height = 300;
+        const glsl = SwissGL(canvas);
+        const withCamera = glsl.hook((glsl, p, t)=>glsl(
+            {...p, Inc:this.glsl_include+(p.Inc||'')}, t));
+        Object.keys(this.demos).forEach(name=>{
+            if (name == 'Spectrogram') return;
+            const dummyGui = new dat.GUI();
+            const demo = new this.demos[name](withCamera, dummyGui);
+            dummyGui.destroy();
+            this.resetCamera();
+            for (let i=0; i<60*5; ++i) {
+                withCamera({Clear:0}, '')
+                demo.frame(withCamera, {time:i/60.0, ...this.viewParams});
+            }
+            const el = document.createElement('div')
+            const data = canvas.toDataURL('image/jpeg', 0.95);
+            el.innerHTML = `
+             <a href="${data}" download="${name}.jpg"><img src="${data}"></a>
+             ${name}`;
+            panel.appendChild(el)
+            if (demo.free) demo.free();
+            glsl.reset();
+        })
+    }
+
+    toggleGui() {
+        if (!this.gui) return;
+        const style = this.gui.domElement.style;
+        style.display = (style.display == 'none')?'':'none'
+    }
+
+    fullscreen() {
+        const {canvas} = this;
+        const f = canvas.requestFullscreen || canvas.webkitRequestFullscreen;
+        if (f) f.apply(canvas);
+    }
+
+}
+</script>
+
+<div id="demo">
+  <canvas id="c" width="640" height="360"></canvas>
+</div>
+<div id="buttons">
+    <button title="settings" onclick="toggleVR()" id="vrButton">VR</button>
+    <button title="fullscreen" onclick="fullscreen()"">⛶</button>
+</div>
+<script>
+    'use strict';
+    const app = new DemoApp([ReactionOrchestra]);
+    function fullscreen() {
+        app.fullscreen();
+    }
+    function toggleVR() {
+        app.toggleXR('vr');
+    }
+</script>
