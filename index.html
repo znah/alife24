@@ -1,0 +1,1156 @@
+<!doctype html>
+<html lang="en">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+
+	<title>reveal.js</title>
+
+	<link rel="stylesheet" href="dist/reset.css">
+	<link rel="stylesheet" href="dist/reveal.css">
+	<link rel="stylesheet" href="dist/theme/black.css">
+
+	<!-- Theme used for syntax highlighted code -->
+	<link rel="stylesheet" href="plugin/highlight/monokai.css">
+	<style>
+		.reveal h2, .reveal h3 {text-transform:none;}
+		.reveal pre code {
+			max-height: 600px;
+		}
+		.splitview {
+			display: flex;
+		}
+		.code {
+			flex: 1.2;
+			overflow: auto;
+			font-size: 80%;
+			align-self: center;
+		}
+		code {
+			background-color: #333;
+		}
+		.demo {
+			background: #222; 
+			flex: 1;
+			align-self: stretch;
+		}
+		canvas {width: 100%; height: 100%;}
+	</style>
+	<script src="swissgl.js"></script>
+	<script>
+		"use strict";
+		const canvas = document.createElement('canvas');
+		const glsl = SwissGL(canvas);
+		let frameFunc = null;
+		let frameCount = 0;
+		canvas.onclick = ()=>{
+			frameCount = 0;
+		}
+		glsl.loop(args=>{
+			if (frameFunc) {
+				glsl.adjustCanvas();
+				try {
+					frameFunc({...args, frameCount});
+					frameCount++;
+				} catch (error) {
+					console.log(error);
+					frameFunc = ()=>glsl({Clear:0});
+				}
+			}
+		});
+		function AddDemo(f) {
+			const root = document.currentScript.parentNode;
+			const demo = root.querySelector('.demo');
+			const src = root.querySelector('#src');
+			if (src) {
+				const lines = f.toString().replaceAll('<', '&lt;').split('\n');
+				src.innerHTML = lines.slice(1,lines.length-1).join('\n');
+			}
+			demo.runDemo = f;
+		}
+	</script>
+</head>
+<body>
+	<div class="reveal">
+		<div class="slides">
+			<section>
+				<h2>SwissGL / WebGPU / WASM</h2>
+				<p>Tiny and beautiful programs <em>living</em> on the Web</p>
+				<p><small>Alexander Mordvintsev, Google, 2024<br></small></p>
+				<p><a href="https://znah.net/alife24">znah.net/alife24</a></p>
+			</section>
+
+			<section>
+				The "joy" of GPU programming
+				<div class="r-stretch" >
+					<iframe loading="lazy" style="width: 150%; max-width: 150%;
+								height: 150%; max-height: 150%; transform: scale(0.67); transform-origin: 0 0;"
+					src="https://webgl2fundamentals.org/webgl/lessons/resources/webgl-state-diagram.html?exampleId=draw-cube-on-cube#no-help"></iframe>
+				</div>
+				<small><a href="https://webgl2fundamentals.org/webgl/lessons/resources/webgl-state-diagram.html">WebGL2 state diagram</a></small>
+			</section>
+
+			<section>
+				<div class="splitview r-stretch">
+					<div class="code">
+						swissgl.js (28Kb)
+						<pre><code data-trim data-line-numbers="|5|13-16,20|17-19">
+							&lt;!DOCTYPE html>
+							&lt;title>Tiny SwissGL example&lt;/title>
+							&lt;meta charset="utf-8">
+							&lt;meta name="viewport" content="width=device-width,initial-scale=1">
+							&lt;script src="swissgl.js">&lt;/script>
+							&lt;style>
+								body, html {margin: 0; padding: 0; overflow: hidden;}
+								#c {width:100vw; height: 100vh}
+							&lt;/style>
+							&lt;canvas id="c">&lt;/canvas>
+							&lt;script>
+								"use strict";
+								const canvas = document.getElementById('c');
+								const glsl = SwissGL(canvas);
+								glsl.loop(({time})=>{
+									glsl.adjustCanvas();        
+									glsl({time, Aspect:'cover',FP:`
+										sin(length(XY)*vec3(30,30.5,31)
+										-time+atan(XY.x,XY.y)*3.),1`});
+								});
+							&lt;/script>
+						</code></pre>
+					</div>
+					<div class="demo"></div>
+					<script>
+						AddDemo(()=>({time})=>{
+							glsl({time, Aspect:'cover',FP:`
+									sin(length(XY)*vec3(30,30.5,31)
+									-time+atan(XY.x,XY.y)*3.),1`});
+						});
+					</script>
+				</div>
+
+			</section>
+
+			<section>
+				<div class="splitview r-stretch">
+					<div class="code">
+						<h3>Simple things must be easy</h3>
+						Fullscreen quad fragment shader<br>(short syntax)
+						<pre class="js"><code data-trim id="src"></code></pre>
+					</div>
+					<div class="demo"></div>
+					<script>
+						AddDemo(()=>({time})=>{
+							glsl({FP:`UV,0,1`});
+						});
+					</script>
+				</div>
+			</section>
+
+			<section>
+				<div class="splitview r-stretch">
+					<div class="code">
+						Fullscreen quad fragment shader<br>(full syntax)
+						<pre class="glsl"><code data-trim id="src"></code></pre>
+						<ul>
+							<li>This function runs in parallel on GPU for every pixel of the canvas (super fast)</li>
+							<li><code>vec2 UV</code> – quad coordinates [0..1]x[0..1]</li>
+							<li><code>vec4 FOut</code> – output color (RGBA)</li>
+							<li>(0,0) is lower left corner in WebGL 😡</li>
+						</ul>
+					</div>
+					<div class="demo"></div>
+					<script>
+						AddDemo(()=>({time})=>{
+							glsl({FP:`
+								void fragment() {
+									FOut = vec4(UV, 0, 1);
+								}
+							`});
+						});
+					</script>
+				</div>
+			</section>
+
+			<section>
+				<div class="splitview r-stretch">
+					<div class="code">
+						<p>We also have <code>vec2 XY</code> (same as UV, but [-1..1]x[-1..1]), and full
+							 <a href="https://www.khronos.org/opengles/sdk/docs/manglsl/docbook4/">GLSL ES</a> to use</p>
+						<pre class="glsl"><code data-trim id="src"></code></pre>
+					</div>
+					<div class="demo"></div>
+					<script>
+						AddDemo(()=>({time})=>{
+							glsl({FP:`sqrt(1.0-length(XY))`});
+						});
+					</script>
+				</div>
+			</section>
+
+			<section>
+				<div class="splitview r-stretch">
+					<div class="code">
+						<p><code>ivec2 I</code> - integer pixel coordinates</p>
+						<pre class="js"><code data-trim id="src"></code></pre>
+						<div data-markdown>
+							* beware of `devicePixelRatio`
+							* useful for rendering into data-textures
+						</div>
+					</div>
+					<div class="demo"></div>
+					<script>
+						AddDemo(()=>({time})=>{
+							glsl({FP:`((I.x/8) ^ (I.y/8))%9 == 0`});
+						});
+					</script>
+				</div>
+			</section>		
+
+			<section data-transition="fade-out">
+				<div class="splitview r-stretch">
+					<div class="code">
+						Maintaining the aspect ratio
+						<pre class="js"><code data-trim data-line-numbers="2" id="src"></code></pre>
+						<p>Options: "fit", "cover", "x", "y", "mean"</p>
+						<p><small>(I'm not 100% happy about this design, might change in th future)</small></p>
+					</div>
+					<div class="demo"></div>
+					<script>
+						AddDemo(()=>({time})=>{
+							glsl({
+								Aspect:'cover',
+								FP:`sqrt(1.0-length(XY))`});
+						});
+					</script>
+				</div>
+			</section>
+
+			<section data-transition="fade-in">
+				<div class="splitview r-stretch">
+					<div class="code">
+						Maintaining the aspect ratio
+						<pre class="js"><code data-trim data-line-numbers="2" id="src"></code></pre>
+						<p>Options: "fit", "cover", "x", "y", "mean"</p>
+						<p><small>(I'm not 100% happy about this design, might change in th future)</small></p>
+					</div>
+					<div class="demo"></div>
+					<script>
+						AddDemo(()=>({time})=>{
+							glsl({
+								Aspect:'fit',
+								FP:`sqrt(1.0-length(XY))`});
+						});
+					</script>
+				</div>
+			</section>
+
+			<section>
+				<div class="splitview r-stretch">
+					<div class="code">
+						We can easily pass uniform values from JS to GLSL
+						<pre class="js"><code data-trim data-line-numbers="2-4" id="src"></code></pre>
+						<div data-markdown>
+							* Any keyword is assumed to be a uniform, except:
+								* `Inc`, `VP`, `FP`,`Clear`, `Blend`, `View`, `Grid`, `Mesh`, `Aspect`, `DepthTest`, `AlphaCoverage`, `Face`</div>
+						<p class="fragment">But why are image top and bottom clipped?</p>
+					</div>
+					<div class="demo"></div>
+					<script>
+						AddDemo(()=>({time})=>{
+							glsl({Aspect:'fit',
+								r: 0.9+Math.sin(time)*0.4, // scalar
+								pos: [0.3, -0.2],          // vec2
+								FP:`sqrt(r-length(XY-pos))`});
+						});
+					</script>
+				</div>
+			</section>
+
+			<section>
+				<div class="splitview r-stretch">
+					<div class="code">
+						SwissGL is a <b>quad drawing library</b>
+						<pre class="js"><code data-trim id="src"></code></pre>
+						<ul>
+							<li>By default it draws a single [-1..1]x[-1..1] quad</li>
+							<span class="fragment">
+							<li>Without <code>Aspect</code> it covers the full view</li>
+							<li><code>Aspect:'fit'</code> makes this quad to fit the view</li>
+							</span>
+							<li class="fragment">Fragment Program (FP) only controls what to draw in this quad, not the quad position</li>
+						</ul>
+					</div>
+					<div class="demo"></div>
+					<script>
+						AddDemo(()=>({time})=>{
+							glsl({Aspect:'fit',
+								FP:`vec3(UV,0)+wireframe(),1`});
+						});
+					</script>
+				</div>
+			</section>					
+
+			<!-- MARK: VP -->
+			<section data-transition="fade">
+				<div class="splitview r-stretch">
+					<div class="code">
+						<h2>Enter the Vertex Program!</h2>
+						<pre class="js"><code data-trim id="src" data-line-numbers="2|3"></code></pre>
+					</div>
+					<div class="demo"></div>
+					<script>
+						AddDemo(()=>({time})=>{
+							glsl({Aspect:'fit', time,
+								VP:`XY*0.4+vec2(cos(time), sin(time*1.3)),0,1`,
+								FP:`vec3(UV,0)+wireframe(),1`});
+						});
+					</script>
+				</div>
+			</section>
+
+			<section data-transition="fade">
+				<div class="splitview r-stretch">
+					<div class="code">
+						<h2>Enter the Vertex Program!</h2>
+						<pre class="glsl"><code data-trim id="src" data-line-numbers="2-6|3|4-5"></code></pre>
+						<small>Full syntax</small>
+					</div>
+					<div class="demo"></div>
+					<script>
+						AddDemo(()=>({time})=>{
+							glsl({Aspect:'fit', time,
+								VP:`void vertex() {
+								  vec2 center = vec2(cos(time), sin(time*1.3));
+								  vec2 cornerOffset = XY*0.4; // XY: [-1..1]^2
+								  VPos.xy = center + cornerOffset;
+								}`,
+								FP:`vec3(UV,0)+wireframe(),1`});
+						});
+					</script>
+				</div>
+			</section>
+
+			<section data-transition="fade">
+				<div class="splitview r-stretch">
+					<div class="code">
+						<h2>Spin me!</h2>
+						<pre class="glsl"><code data-trim id="src" data-line-numbers="4"></code></pre>
+						<div data-markdown>
+							* `mat2 rot2(float)` - handy tool to make 2D rotation matrices
+						</div>
+						<p class="fragment" style="font-size:150%">Is quad boring? 🥱</p>
+					</div>
+					<div class="demo"></div>
+					<script>
+						AddDemo(()=>({time})=>{
+							glsl({Aspect:'fit', time,
+								VP:`void vertex() {
+								  vec2 center = vec2(cos(time), sin(time*1.3));
+								  vec2 cornerOffset = rot2(time)*XY*0.4;
+								  VPos.xy = center + cornerOffset;
+								}`,
+								FP:`vec3(UV,0)+wireframe(),1`});
+						});
+					</script>
+				</div>
+			</section>
+			
+			<!-- MARK: Mesh -->
+			<section data-transition="fade">
+				<div class="splitview r-stretch">
+					<div class="code">
+						<h2>Tesselate!</h2>
+						<pre class="glsl"><code data-trim id="src" data-line-numbers="|2|3-5|7-8|9-10|11|12-13"></code></pre>
+					</div>
+					<div class="demo"></div>
+					<script>
+						AddDemo(()=>({time})=>{
+							glsl({Aspect:'fit', time,
+								Mesh: [64,1], VP:`
+								vec2 path(float t) {
+									return rot2(t)[0]*sin(t*2.0);
+								}
+								void vertex() {
+									float t = time*0.5 - XY.x*1.5;
+									vec2 center = path(t);
+									vec2 tangent = normalize(path(t+0.01)-center);
+									vec2 normal = rot2(PI/2.)*tangent;
+									float width = 0.1 * (1.0-XY.x*XY.x);
+									vec2 offset = width * XY.y * normal;
+									VPos.xy = center + offset;
+								}`,
+								FP:`vec3(UV,0)+wireframe(),1`});
+						});
+					</script>
+				</div>
+			</section>	
+			
+			<section data-transition="fade">
+				<div class="splitview r-stretch">
+					<div class="code">
+						<h2>Add texture with FP</h2>
+						<pre class="glsl"><code data-trim id="src" data-line-numbers="15"></code></pre>
+					</div>
+					<div class="demo"></div>
+					<script>
+						AddDemo(()=>({time})=>{
+							glsl({Aspect:'fit', time,
+								Mesh: [64,1], VP:`
+								vec2 path(float t) {
+									return rot2(t)[0]*sin(t*2.0);
+								}
+								void vertex() {
+									float t = time*0.5 - XY.x*1.5;
+									vec2 center = path(t);
+									vec2 tangent = normalize(path(t+0.01)-center);
+									vec2 normal = rot2(PI/2.)*tangent;
+									float width = 0.1 * (1.0-XY.x*XY.x);
+									vec2 offset = width * XY.y * normal;
+									VPos.xy = center + offset;
+								}`,
+								FP:`cos(XY.y*15.0)*0.5+0.5`});
+						});
+					</script>
+				</div>
+			</section>
+
+			<section>
+				<div class="splitview r-stretch">
+					<div class="code">
+						<h2>Tesselate 2D</h2>
+						<pre class="glsl"><code data-trim id="src" data-line-numbers="2|3-4"></code></pre>
+					</div>
+					<div class="demo"></div>
+					<script>
+						AddDemo(()=>({time})=>{
+							glsl({Aspect:'fit', time,
+								Mesh: [8,8], VP:`
+								vec2 ofs = cos(XY.yx*2.0+time*vec2(1.0, 1.4));
+								VPos.xy = XY*0.8 + ofs*0.15;`,
+								FP:`vec3(UV,0)+wireframe(),1`});
+						});
+					</script>
+				</div>
+			</section>
+
+			<section>
+				<div class="splitview r-stretch">
+					<div class="code">
+						<h2>Why such a strange triangulation?</h2>
+						<pre class="glsl"><code data-trim id="src" data-line-numbers="4-5"></code></pre>
+						<div data-markdown>
+							(to make the triangular grid if needed)
+
+							* `ivec2 VID` – vertex index in a mesh
+							* `ivec2 Mesh` – mesh size
+						</div>
+					</div>
+					<div class="demo"></div>
+					<script>
+						AddDemo(()=>({time})=>{
+							glsl({Aspect:'fit', time,
+								Mesh: [8,8], VP:`
+								float t = sin(time*2.0)*0.5+0.5;
+								VPos.x += t * (0.5-float(VID.y&1)) / float(Mesh.x);
+								VPos.y *= mix(1.0, sin(PI/3.), t);
+								VPos.xy *= 0.8;`, 
+								FP:`vec3(UV,0)+wireframe(),1`});
+						});
+					</script>
+				</div>
+			</section>
+
+			<!-- MARK: Grid -->
+			<section>
+				<h2>Drawing many things at once</h2>
+				<h2><s> for(...) {} </s></h2>
+			</section>
+			<section  data-transition="fade">
+				<div class="splitview r-stretch">
+					<div class="code">
+						<h2>Instancing</h2>
+						<pre class="glsl"><code data-trim id="src" data-line-numbers="2|3|4|5"></code></pre>
+						<div data-markdown>
+							* `ivec3 Grid` – instance grid size
+							* `ivec3 ID` – instance index
+						</div>
+					</div>
+					<div class="demo"></div>
+					<script>
+						AddDemo(()=>({time})=>{
+							glsl({Aspect:'fit', time,
+								Grid: [8,8], VP:`
+								vec2 p = (vec2(ID.xy)+0.5) / vec2(Grid.xy);
+								float r = sin(p.x*4.0 + p.y*6.0 + time)*0.5+0.5;
+								VPos.xy = 2.0*p-1.0 + XY*r*0.1;`, 
+								FP:`0.7`});
+						});
+					</script>
+				</div>
+			</section>
+
+			<section data-transition="fade">
+				<div class="splitview r-stretch">
+					<div class="code">
+						<h2>Passing data VP -> FP</h2>
+						<pre class="glsl"><code data-trim id="src" data-line-numbers="5-6,8"></code></pre>
+						<div data-markdown>
+							Quad color is computer by the Vertex Program and passed
+							to the Fragment Program using `varying`
+						</div>
+					</div>
+					<div class="demo"></div>
+					<script>
+						AddDemo(()=>({time})=>{
+							glsl({Aspect:'fit', time,
+								Grid: [8,8], VP:`
+								vec2 p = (vec2(ID.xy)+0.5) / vec2(Grid.xy);
+								float r = sin(p.x*4.0 + p.y*6.0 + time)*0.5+0.5;
+								varying vec3 color = mix(
+									vec3(0.1, 0.1, 0.6), vec3(0.8, 0.6, 0.1), r);
+								VPos.xy = 2.0*p-1.0 + XY*r*0.1;`, 
+								FP:`color,1`});
+						});
+					</script>
+				</div>
+			</section>
+
+			<section data-transition="fade">
+				<div class="splitview r-stretch">
+					<div class="code">
+						<h2>Adding some randomness</h2>
+						<pre class="glsl"><code data-trim id="src" data-line-numbers="4-6"></code></pre>
+						<div data-markdown>
+							* `vec3 hash(ivec3)` maps an integer vector into a "random" vector in [0..1]^3
+							* `TAU = 2.0*PI` 🙃
+						</div>
+					</div>
+					<div class="demo"></div>
+					<script>
+						AddDemo(()=>({time})=>{
+							glsl({Aspect:'fit', time,
+								Grid: [8,8], VP:`
+								vec2 p = (vec2(ID.xy)+0.5) / vec2(Grid.xy);
+								vec3 rnd = hash(ID);
+								float phase = rnd.x*TAU, freq = rnd.y*3.0+0.5;
+								float r = sin(phase + freq*time)*0.5+0.5;
+								varying vec3 color = mix(
+									vec3(0.1, 0.1, 0.6), vec3(0.8, 0.6, 0.1), r);
+								VPos.xy = 2.0*p.xy-1.0 + XY*r*0.1;`, 
+								FP:`color,1`});
+						});
+					</script>
+				</div>
+			</section>
+
+			<section data-transition="fade">
+				<div class="splitview r-stretch">
+					<div class="code">
+						<h2><code>Grid</code> and <code>Mesh</code> work together</h2>
+						<pre class="glsl"><code data-trim id="src" data-line-numbers="2,6"></code></pre>
+					</div>
+					<div class="demo"></div>
+					<script>
+						AddDemo(()=>({time})=>{
+							glsl({Aspect:'fit', time,
+								Grid: [8,8], Mesh:[5,5], VP:`
+								vec2 p = (vec2(ID.xy)+0.5) / vec2(Grid.xy);
+								vec3 rnd = hash(ID);
+								float phase = rnd.x*TAU, freq = rnd.y*3.0+0.5;
+								phase += length(XY);
+								float r = sin(phase + freq*time)*0.5+0.5;
+								varying vec3 color = mix(
+									vec3(0.1, 0.1, 0.6), vec3(0.8, 0.6, 0.1), r);
+								VPos.xy = 2.0*p.xy-1.0 + XY*r*0.1;`, 
+								FP:`color,1`});
+						});
+					</script>
+				</div>
+			</section>			
+
+			<!-- MARK: Cube -->
+			<section data-transition="convex">
+				<H1>3D</H1>
+			</section>
+
+			<section data-transition="fade">
+				<div class="splitview r-stretch">
+					<div class="code">
+						<h2>Spinning 3D Cube</h2>
+						(SwissGL way)
+						<pre class="glsl"><code data-trim id="src" data-line-numbers="2|3|4-5|6-7"></code></pre>
+						<div data-markdown>
+							`vec3 cubeVert(vec2 xy, int face)`
+						</div>
+						<p class="fragment">Problem?</p>
+					</div>
+					<div class="demo"></div>
+					<script>
+						AddDemo(()=>({time})=>{
+							glsl({Aspect:'fit', time,
+								Grid: [6], VP:`
+								VPos.xyz = cubeVert(XY, ID.x)*0.4;
+								VPos.xy *= rot2(time);
+								VPos.xz *= rot2(time*0.5);
+								varying vec3 color = 
+									cubeVert(vec2(0), ID.x)*0.3+0.5;
+								`, FP:`color,1`});
+						});
+					</script>
+				</div>
+			</section>
+
+			<section data-transition="fade">
+				<div class="splitview r-stretch">
+					<div class="code">
+						<h2>Z-buffer to the rescue!</h2>
+						<pre class="glsl"><code data-trim id="src" data-line-numbers="2"></code></pre>
+						<p class="fragment">In simple cases we may also use<br><code>Face:'front'</code> or
+							<code>Face:'back'</code></p>
+						<p class="fragment">No perspective?</p>
+					</div>
+					<div class="demo"></div>
+					<script>
+						AddDemo(()=>({time})=>{
+							glsl({Aspect:'fit', time,
+								DepthTest:1,
+								Grid: [6], VP:`
+								VPos.xyz = cubeVert(XY, ID.x)*0.4;
+								VPos.xy *= rot2(time);
+								VPos.xz *= rot2(time*0.5);
+								varying vec3 color = 
+									cubeVert(vec2(0), ID.x)*0.3+0.5;
+								`, FP:`color,1`});
+						});
+					</script>
+				</div>
+			</section>
+
+			<section data-transition="fade">
+				<div class="splitview r-stretch">
+					<div class="code">
+						<h2>Perspective division</h2>
+						<pre class="glsl"><code data-trim id="src" data-line-numbers="6"></code></pre>
+						<div data-markdown>
+							* GL does [x,y,z,w] -> [x/w, y/w, z/w, 1]
+							* we adjust `w` to magnify `xy` if z>0.0 and shrink if z&lt;0.0 (z-axis looks at the camera)
+							* downscale `z` to prevent clipping out of [-1..1]
+							* I think I'll add this function to SwissGL soon
+							* canonical way to do this is "Projection matrix"
+							* use [glMatrix](https://github.com/toji/gl-matrix) for the canonical way
+						</div>
+					</div>
+					<div class="demo"></div>
+					<script>
+						AddDemo(()=>({time})=>{
+							glsl({Aspect:'fit', time, DepthTest:1,
+								Face:'front',Grid: [6], VP:`
+								VPos.xyz = cubeVert(XY, ID.x)*0.4;
+								VPos.xy *= rot2(time);
+								VPos.xz *= rot2(time*0.5);
+								VPos.zw = vec2(-VPos.z*0.1, 1.0-VPos.z*0.6);
+								varying vec3 color = 
+									cubeVert(vec2(0), ID.x)*0.3+0.5;
+								`, FP:`color,1`});
+						});
+					</script>
+				</div>
+			</section>
+
+			<section data-transition="fade">
+				<div class="splitview r-stretch">
+					<div class="code">
+						<h2>1000 cubes</h2>
+						<pre class="glsl"><code data-trim id="src" data-line-numbers="2|3-4"></code></pre>
+					</div>
+					<div class="demo"></div>
+					<script>
+						AddDemo(()=>({time})=>{
+							glsl({Aspect:'fit', time, DepthTest:1,
+								Grid: [6, 1000], Face:'front', VP:`
+								VPos.xyz = cubeVert(XY, ID.x)*0.03;
+								VPos.xyz += hash(ivec3(ID.y,1,2))*2.0-1.0;
+								VPos.xy *= rot2(time);
+								VPos.xz *= rot2(time*0.5);
+								VPos.zw = vec2(-VPos.z*0.1, 1.0-VPos.z*0.6);
+								varying vec3 color = 
+									cubeVert(vec2(0), ID.x)*0.3+0.5;
+								`, FP:`color,1`});
+						});
+					</script>
+				</div>
+			</section>
+
+			<section data-transition="fade">
+				<div class="splitview r-stretch">
+					<div class="code">
+						<h2>Color cube</h2>
+						<pre class="glsl"><code data-trim id="src" data-line-numbers="3-4,9"></code></pre>
+						<p>We can also pass per-vertex colors</p>
+					</div>
+					<div class="demo"></div>
+					<script>
+						AddDemo(()=>({time})=>{
+							glsl({Aspect:'fit', time, DepthTest:1,
+								Grid: [6], VP:`
+								vec3 p = cubeVert(XY, ID.x);
+								varying vec3 color = p*0.5+0.5;
+								VPos.xyz = p*0.4;
+								VPos.xy *= rot2(time);
+								VPos.xz *= rot2(time*0.5);
+								VPos.zw = vec2(-VPos.z*0.1, 1.0-VPos.z*0.6);
+								`, FP:`color+wireframe(),1`});
+						});
+					</script>
+				</div>
+			</section>
+			
+			<section data-transition="fade">
+				<div class="splitview r-stretch">
+					<div class="code">
+						<h2>Surface Normals</h2>
+						<pre class="glsl"><code data-trim id="src" data-line-numbers="2-3,12-13,16|4-6|7-9"></code></pre>
+						<div data-markdown>
+							* `SURF` – marco that uses finite differences to estimate the normal of `surface_f`
+							* in this example we obtain the view-space normal
+						</div>
+					</div>
+					<div class="demo"></div>
+					<script>
+						AddDemo(()=>({time})=>{
+							glsl({Aspect:'fit', time, DepthTest:1, Face:'front',
+								Grid:[6], Mesh:[32,32], VP:`
+								vec3 surface_f(vec2 xy) { // [-1..1]^2 -> 3D
+									vec2 a = xy*PI/2.0, s = sin(a), c = cos(a);
+									vec3 z = cubeVert(vec2(0), ID.x);
+									vec3 p = cubeVert(s, ID.x) + z*(c.x*c.y);
+									p.xy *= rot2(time);
+									p.xz *= rot2(time*0.5);
+									return p*0.4;
+								}
+								void vertex() {
+									varying vec3 normal;
+									VPos.xyz = SURF(surface_f, XY, normal, 1e-3);
+									VPos.zw = vec2(-VPos.z*0.1, 1.0-VPos.z*0.6);
+								}`,
+								FP:`normal*0.5+0.5+wireframe()*0.1,1`});
+						});
+					</script>
+				</div>
+			</section>					
+
+			<!-- MARK: Blending -->
+			<section>
+				<h2>Back to the plane for now...</h2>
+			</section>
+
+			<section data-transition="fade">
+				<div class="splitview r-stretch">
+					<div class="code">
+						<h2>Let's draw some fireflies</h2>
+						<pre class="glsl"><code data-trim id="src" data-line-numbers="2|3|4-5|6|7"></code></pre>
+						<p class="fragment">Fragment program draws a radially decaying sprite, but it's still a opaque quad</p>
+					</div>
+					<div class="demo"></div>
+					<script>
+						AddDemo(()=>({time})=>{
+							glsl({Aspect:'fit', time, Grid:[256], 
+								VP:`vec3 rnd = hash(ID);
+								float t = time*(1.0+rnd.z*0.8)*0.2+rnd.z*100.0;
+								vec2 p = vec2(sin(t*2.0)*0.8, sin(t)*1.2);
+								p += (rnd.xy-0.5)*0.3;
+								VPos.xy = p + XY*0.05;`, 
+								FP:`exp(-dot(XY,XY)*3.0)`});
+						});
+					</script>
+				</div>
+			</section>
+
+			<section data-transition="fade">
+				<div class="splitview r-stretch">
+					<div class="code">
+						<h2>Enter <code>Blend</code></h2>
+						<pre class="glsl"><code data-trim id="src" data-line-numbers="2"></code></pre>
+						<div data-markdown>
+							* `Blend` string is an expression using a small embedded language
+								* `s`/`sa` - source (incoming) rgb/alpha
+								* `d`/`da` - destination (existing) rgb/alpha
+							* Examples:
+								* `d+s` - additive blending
+								* `d*(1-sa)+s*sa` - standard alpha overlay (assume far to near draw order)
+								* `d*(1-sa)+s` - premultiplied alpha
+								* `max(s,d)`/`min(s,d)` - useful for making cellular Voronoi-patterns
+						</div>
+					</div>
+					<div class="demo"></div>
+					<script>
+						AddDemo(()=>({time})=>{
+							glsl({Aspect:'fit', time, Grid:[256],
+								Blend:'s+d',	
+								VP:`vec3 rnd = hash(ID);
+								float t = time*(1.0+rnd.z*0.8)*0.2+rnd.z*100.0;
+								vec2 p = vec2(sin(t*2.0)*0.8, sin(t)*1.2);
+								p += (rnd.xy-0.5)*0.3;
+								VPos.xy = p + XY*0.05;`, 
+								FP:`exp(-dot(XY,XY)*3.0)`});
+						});
+					</script>
+				</div>
+			</section>
+
+			<section>
+				<div class="splitview r-stretch">
+					<div class="code">
+						<h2>Voronoi bubbles</h2>
+						<pre class="glsl"><code data-trim id="src" data-line-numbers="2|3-6|7"></code></pre>
+					</div>
+					<div class="demo"></div>
+					<script>
+						AddDemo(()=>({time})=>{
+							glsl({Aspect:'fit', time, Grid:[256],
+								Blend:'max(s,d)', VP:`
+								vec3 rnd = hash(ID);
+								float r = sqrt(rnd.y);
+								float ang = rnd.x*TAU + 0.25*time/r;
+								VPos.xy = rot2(ang)[0]*r + XY*0.15;`, 
+								FP:`1.0-length(XY)`});
+						});
+					</script>
+				</div>
+			</section>
+
+			<!-- MARK: Textures -->
+			<section>
+				<h2>Stateful computation</h2>
+				(textures!)
+			</section>
+
+			<section>
+				<div class="splitview r-stretch">
+					<div class="code">
+						<h2>The <em>second argument</em></h2>
+						<pre class="js"><code data-trim id="src" data-line-numbers="1-2|3-4|5"></code></pre>
+						<div data-markdown>
+							* The first argument tells what to draw, the second - where to store the result
+							* We can also omit drawing completely and push `data` to GPU
+							* Each texture must have a unique `tag`
+								* SwissGL will update existing texture if a `tag` was already seen
+								* Way to stream bulk data JS->GPU
+							* Textures are passed like uniforms and queried like functions
+						</div>
+
+					</div>
+					<div class="demo"></div>
+					<script>
+						AddDemo(()=>({time})=>{
+							const data = new Uint8Array(
+								[255, 0, 0, Math.cos(time*2.)*128+127]);
+							const tex = glsl({}, 
+								{data, size:[2,2], format:'r8', tag:'checkers'})
+							glsl({tex, FP:`tex(UV*4.0).r`});
+						});
+					</script>
+				</div>
+			</section>
+
+			<section>
+				<div class="splitview r-stretch">
+					<div class="code">
+						<h2>Streaming videos</h2>
+						(or loading images, canvases)
+						<pre class="js"><code data-trim id="src" data-line-numbers="|7|8"></code></pre>
+						<div data-markdown>
+						</div>
+
+					</div>
+					<div class="demo"></div>
+					<script>
+						function initCamera() {
+							const video = document.createElement('video');
+							navigator.mediaDevices.getUserMedia({ video: true })
+							.then((stream) => {
+								video.srcObject = stream;
+								video.play();
+							}).catch(console.error);
+							return video;
+						}
+						AddDemo(()=>{
+							const video = initCamera(); // HTMLVideoElement	
+							function onFrame() {	
+								if (!video.videoWidth) {  // not ready? 
+									glsl({Clear:[0,0.3,0,1]})
+									return;
+								}
+								const tex = glsl({}, {data:video, tag:'video'})
+								glsl({tex, Aspect:'fit', FP:`tex(1.0-UV)`});
+							}
+						return onFrame});
+					</script>
+				</div>
+			</section>
+
+			<section data-transition="fade">
+				<div class="splitview r-stretch">
+					<div class="code">
+						<h2>Render-to-texture</h2>
+						<pre class="js"><code data-trim id="src" data-line-numbers="1-3|4|5"></code></pre>
+						<div data-markdown><script type="text/template">
+							* Shaders, texture targets, framebuffers, samplers are all created _right here, right now_
+							* `tag`'s enable object reuse, so init code is often not needed
+							*  note the persistance of the target pixels <!-- .element: class="fragment" -->
+						</script></div>
+					</div>
+					<div class="demo"></div>
+					<script>
+						AddDemo(()=>({time})=>{
+							const tex = glsl({time,
+								VP:`rot2(time)*XY*sin(time*0.5)*0.7,0,1`,
+								FP:`UV,0,1`},
+								{size:[64, 64], tag:'rtt'})
+							glsl({tex, Aspect:'fit', FP:`tex(UV)`});
+						});
+					</script>
+				</div>
+			</section>
+
+			<section data-transition="fade">
+				<div class="splitview r-stretch">
+					<div class="code">
+						<h2><code>Clear</code></h2>
+						<pre class="js"><code data-trim id="src" data-line-numbers="1"></code></pre>
+						<div data-markdown><script type="text/template">
+							* Use `Clear:val` or `Clear:[r,g,b,a]` to clear the texture before drawing
+						</script></div>
+					</div>
+					<div class="demo"></div>
+					<script>
+						AddDemo(()=>({time})=>{
+							const tex = glsl({time, Clear:[0.1,0.1,0.5,1.0],
+								VP:`rot2(time)*XY*sin(time*0.5)*0.7,0,1`,
+								FP:`UV,0,1`},
+								{size:[64, 64], tag:'rtt2'})
+							glsl({tex, Aspect:'fit', FP:`tex(UV)`});
+						});
+					</script>
+				</div>
+			</section>
+			
+			<section data-transition="fade">
+				<div class="splitview r-stretch">
+					<div class="code">
+						<h2>Sampling control</h2>
+						<pre class="js"><code data-trim id="src" data-line-numbers="6-8"></code></pre>
+					</div>
+					<div class="demo"></div>
+					<script>
+						AddDemo(()=>({time})=>{
+							const tex = glsl({time, Clear:0.25,
+								VP:`rot2(time)*XY*sin(time*0.5)*0.9,0,1`,
+								FP:`UV,0,1`},
+								{size:[32, 32], tag:'rtt3'})
+							glsl({Aspect:'fit',
+								A:tex.edge, B:tex.linear.mirror, FP:`
+								vec2 p = UV*2.0-0.5;
+								FOut = XY.y<0.0 ? A(p) : B(p)`});
+						});
+					</script>
+				</div>
+			</section>
+
+			<!-- MARK: Data Textures -->
+			<section data-transition="fade">
+				<div class="splitview r-stretch">
+					<div class="code">
+						<h2>Data textures (float32)</h2>
+						<pre class="js"><code data-trim id="src" data-line-numbers="2-4|5|6"></code></pre>
+					</div>
+					<div class="demo"></div>
+					<script>
+						AddDemo(()=>({time})=>{
+							const points = glsl({FP:`
+								vec3 rnd = hash(I.xyx);
+								vec2 pos = (rnd.xy-0.5)*12.0;
+								FOut = vec4(pos, 0, 0);`},
+								{size:[32, 32], format:'rgba32f', tag:'points'})
+							glsl({points, FP:`points(UV).xy/6.0+0.5, 0, 1`});
+						});
+					</script>
+				</div>
+			</section>
+
+			<section data-transition="fade">
+				<div class="splitview r-stretch">
+					<div class="code">
+						<h2>Vertex Texture Fetch</h2>
+						<pre class="js"><code data-trim id="src" data-line-numbers="6-10|7|8-9"></code></pre>
+						<p class="fragment">Note the use of integer pixel coordinates</p>
+					</div>
+					<div class="demo"></div>
+					<script>
+						AddDemo(()=>({time})=>{
+							const points = glsl({FP:`
+								vec3 rnd = hash(I.xyx);
+								vec2 pos = (rnd.xy-0.5)*12.0;
+								FOut = vec4(pos, 0, 0);`},
+								{size:[32, 32], format:'rgba32f', tag:'points'})
+							glsl({Aspect:'fit', Blend:'d*(1-sa)+s*sa',
+								points, Grid:points.size, VP:`
+								vec2 p = points(ID.xy).xy;
+								VPos.xy = p/8.0 + XY*0.05;`,
+								FP:`1.0-length(XY)`});
+						});
+					</script>
+				</div>
+			</section>
+
+			<section data-transition="fade">
+				<div class="splitview r-stretch">
+					<div class="code">
+						<h2>Preserving the history</h2>
+						<p>(ping-pong buffers)</p>
+						<pre class="js"><code data-trim id="src" data-line-numbers="1-9|9|11|2|1,3-5|6-7"></code></pre>
+					</div>
+					<div class="demo"></div>
+					<script>
+						AddDemo(()=>({time, frameCount})=>{
+							const points = glsl({frameCount, FP:`
+								vec2 pos = Src(I).xy;
+								if (frameCount==0.0) {
+									pos = (hash(I.xyx).xy-0.5)*12.0;
+								}
+								vec2 vel = rot2(PI/2.)*pos;
+								FOut = vec4(pos + vel*0.01, 0, 0);`},
+								{size:[32, 32], format:'rgba32f', tag:'points2',
+									story:2})
+							glsl({Aspect:'fit', Blend:'d*(1-sa)+s*sa',
+								points:points[0], Grid:points.size, VP:`
+								vec2 p = points(ID.xy).xy;
+								VPos.xy = p/8.0 + XY*0.05;`,
+								FP:`1.0-length(XY)`});
+						});
+					</script>
+				</div>
+			</section>
+
+			<section data-transition="fade">
+				<div class="splitview r-stretch">
+					<div class="code">
+						<h2>Making particles interact</h2>
+						<pre class="js"><code data-trim id="src" data-line-numbers="|7-14|9|10-12|13|15"></code></pre>
+					</div>
+					<div class="demo"></div>
+					<script>
+						AddDemo(()=>({time, frameCount})=>{
+							const points = glsl({frameCount, FP:`
+								if (frameCount==0.0) {
+									FOut.xy = (hash(I.xyx).xy-0.5)*12.0;
+									return;
+								}
+								vec2 pos = Src(I).xy, vel = vec2(0);
+								for (int y=0; y<ViewSize.y; ++y)
+								for (int x=0; x<ViewSize.x; ++x) {
+									if (I == ivec2(x,y)) continue;
+									vec2 dp = Src(ivec2(x,y)).xy-pos;
+									float r = length(dp);
+									dp /= r+1e-8;
+									vel -= dp * max(1.0-r*2.0, 0.0);
+								}
+								FOut = vec4(pos + vel*0.1, 0, 0);`},
+								{size:[32, 32], format:'rgba32f', tag:'points2',
+									story:2})
+							glsl({Aspect:'fit', Blend:'max(s,d)',
+								points:points[0], Grid:points.size, VP:`
+								vec2 p = points(ID.xy).xy;
+								VPos.xy = p/8.0 + XY*0.05;`,
+								FP:`1.0-length(XY)`});
+						});
+					</script>
+				</div>
+			</section>
+
+			<!-- MARK: Particle Lenia -->
+			<section data-transition="fade">
+				<div class="splitview r-stretch">
+					<div class="code">
+						<h2>Yet Another Particle Lenia</h2>
+						<pre class="js"><code data-trim id="src" data-line-numbers="|3-26|6-7|1,10-11,17-19|21-23|27-33|33-38"></code></pre>
+					</div>
+					<div class="demo"></div>
+					<script>
+						AddDemo(()=>({time, frameCount})=>{
+							const s2 = [1.,4.,8.], viewR=9.0;
+							let points;
+							for (let i=0; i<10; ++i) {
+								points = glsl({frameCount, s2, time, FP:`
+									if (frameCount==0.0) {
+										int seed = int(time*1000.0);
+										FOut.xy = (hash(I.xyx+seed).xy-0.5)*12.0;
+										return;
+									}
+									vec3 pos = Src(I).xyz, field=vec3(0);
+									mat3 grad = mat3(0);
+									for (int y=0; y<ViewSize.y; ++y)
+									for (int x=0; x<ViewSize.x; ++x) {
+										vec3 dp = pos - Src(ivec2(x, y)).xyz;
+										float r = length(dp);
+										dp /= r+1e-8;
+										vec3 f=exp(-r*r*s2), f_dr=-2.0*r*f*s2;
+										field += f;
+										grad += outerProduct(dp, f_dr);
+									}
+									const vec3 target = vec3(9.0,5.0,0.0);
+									vec3 force = -grad*(field-target);
+									FOut.xyz = pos+force*0.01;`},
+									{size:[20, 20], format:'rgba32f', tag:'points3',
+										story:2})
+							}
+							// render glowing fields
+							glsl({Blend:'s+d', Aspect:'fit', s2, viewR,
+								points:points[0], Grid:points.size, VP:`
+								(points(ID.xy).xy + XY*2.0)/viewR,0,1`, FP:`
+								float r = 2.0*length(XY);
+								FOut = vec4(exp(-r*r*s2)*s2*0.045, 1.0);`});   
+							// render points
+							glsl({Aspect:'fit', Blend:'max(s,d)', viewR,
+								points:points[0], Grid:points.size, VP:`
+								vec2 p = points(ID.xy).xy;
+								VPos.xy = p/viewR + XY*0.05;`,
+								FP:`1.0-length(XY)`});
+						});
+					</script>
+				</div>
+			</section>			
+
+
+		</div>
+	</div>
+
+	<script src="dist/reveal.js"></script>
+	<script src="plugin/notes/notes.js"></script>
+	<script src="plugin/markdown/markdown.js"></script>
+	<script src="plugin/highlight/highlight.js"></script>
+	<script>
+
+		function onSlide(slide) {
+			const demo = slide.querySelector('.demo');
+			if (!demo) {
+				frameFunc = null;
+				return;
+			}
+			demo.appendChild(canvas);
+			frameFunc = demo.runDemo();
+			frameCount = 0;
+		}
+
+		Reveal.initialize({
+			slideNumber: 'c/t',
+			hash: true,
+			width: 1280, height: 800,
+			plugins: [ RevealMarkdown, RevealHighlight, RevealNotes ]
+		}).then(()=>onSlide(Reveal.getCurrentSlide()));
+		Reveal.on('slidechanged', e=>{
+			setTimeout(()=>onSlide(e.currentSlide), 200);
+		});
+	</script>
+</body>
+</html>
